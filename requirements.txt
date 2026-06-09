@@ -1,0 +1,12 @@
+# Runtime — the engine, demo, and CLI need only these two.
+numpy>=1.24
+scipy>=1.10
+
+# Optional: MLX accelerates judge training on Apple Silicon. It is auto-detected;
+# set DROID_MLX=0 to force the pure-numpy path. Not required to run the demo.
+#   mlx>=0.18 ; platform_system == "Darwin"
+
+# Dev/test only — the test suite needs pytest, which the runtime path does not.
+# Install it explicitly before running the tests:
+#   pip install pytest>=7
+# then:  DROID_NO_EMBED=1 python3 -m pytest -q

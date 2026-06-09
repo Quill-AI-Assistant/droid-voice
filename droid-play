@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""droid-play — play one droid-sound-layer cue for an event.
+
+    droid-play <event> [--profile qd] [--list]
+
+Resolves event -> (slug, category) via catalog.json, applies the toggles and
+profile routing in config.json, then plays profiles/<profile>/<slug>.wav via
+`afplay -v <volume>` in the background. It is the single entry point for BOTH
+session sounds (the play-sound.sh hook) and macropad sounds (voice-ctl,
+lights-events.lua).
+
+Design rules:
+- stdlib only + fast: it is called per tool-use and per macropad keypress, so
+  no third-party imports and no heavy work on the hot path.
+- NEVER fail a caller: any error (missing config, unknown event, no sound file,
+  sounds disabled) exits 0 silently. A hook must never break because a cue is
+  missing.
+
+Profile routing: qd is the only droid voice — profile.session "auto" and
+profile.macropad both resolve to qd. The category of the event (from the catalog)
+decides which routing key applies.
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CATALOG = os.path.join(HERE, "catalog.json")
+CONFIG = os.path.join(HERE, "config.json")
+PROFILES = os.path.join(HERE, "profiles")
+
+
+def _load(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _resolve_profile(category, config):
+    routing = (config.get("profile") or {})
+    choice = routing.get(category, "auto")
+    if choice == "auto":
+        return "qd"        # qd is the only droid voice
+    return choice
+
+
+def _find_sound(profile, slug):
+    for ext in ("wav", "mp3", "aiff", "aif", "m4a", "caf"):
+        p = os.path.join(PROFILES, profile, f"{slug}.{ext}")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def main():
+    args = sys.argv[1:]
+    catalog = _load(CATALOG) or {}
+    config = _load(CONFIG) or {}
+
+    if "--list" in args:
+        events = (catalog.get("events") or {})
+        for name, spec in events.items():
+            print(f"{name}\t{spec.get('category')}\t{spec.get('slug')}")
+        return
+
+    profile_override = None
+    if "--profile" in args:
+        i = args.index("--profile")
+        if i + 1 < len(args):
+            profile_override = args[i + 1]
+            args = args[:i] + args[i + 2:]
+
+    if not args:
+        return  # nothing to play
+    event = args[0]
+
+    # --which: print the resolution (path or 'muted: reason') and exit, no audio.
+    # Useful for verifying the catalog/config and from the /sounds skill.
+    dry = "--which" in args
+    if dry:
+        args = [a for a in args if a != "--which"]
+        event = args[0] if args else event
+
+    if not config.get("enabled", True):
+        if dry:
+            print("muted: layer disabled")
+        return
+
+    spec = (catalog.get("events") or {}).get(event)
+    if not spec:
+        if dry:
+            print(f"muted: unknown event '{event}'")
+        return  # unknown event — silently ignore
+    category = spec.get("category", "session")
+    slug = spec.get("slug", event)
+
+    if not (config.get("categories") or {}).get(category, True):
+        if dry:
+            print(f"muted: category '{category}' off")
+        return  # this category is muted
+
+    profile = profile_override or _resolve_profile(category, config)
+    sound = _find_sound(profile, slug)
+    if not sound:
+        fb = config.get("fallback_profile", "qd")
+        if fb and fb != "none" and fb != profile:
+            sound = _find_sound(fb, slug)
+    if not sound:
+        if dry:
+            print(f"muted: no '{slug}' sound in profile '{profile}' (or fallback)")
+        return  # no sound for this event in this profile — silent, not an error
+
+    if dry:
+        print(f"play: {sound}  (event={event} category={category} profile={profile})")
+        return
+
+    vol = config.get("volume", 1.0)
+    try:
+        vol = max(0.0, min(2.0, float(vol)))
+    except (TypeError, ValueError):
+        vol = 1.0
+
+    # Background afplay; detached so the caller (hook/keypress) returns instantly.
+    try:
+        subprocess.Popen(
+            ["afplay", "-v", f"{vol}", sound],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass  # never break a hook
+    sys.exit(0)

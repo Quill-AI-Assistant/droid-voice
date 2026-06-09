@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""droid eval — the judge's quality + the dataset at a glance (scriptable).
+
+    droid eval [profile]            held-out AUC (multi-seed), votes, per-case coverage
+    droid eval [profile] --seeds 8  average AUC over more splits (steadier number)
+
+Read-only — the same gate metric the studio shows, here for scripts and for
+watching a judge while you train it."""
+import argparse
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from dvoice import reward as R        # noqa: E402
+from dvoice import store              # noqa: E402
+from dvoice import versions           # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(description="judge quality + dataset stats")
+    ap.add_argument("profile", nargs="?", default="qd")
+    ap.add_argument("--seeds", type=int, default=5, help="held-out splits to average AUC over")
+    ap.add_argument("--quiet", action="store_true", help="summary only, no per-case bars")
+    args = ap.parse_args()
+
+    p = args.profile
+    av = versions.active_version(p)
+    ds = store.active_dataset(p)
+    res = R.fit_and_eval(p, seeds=tuple(range(max(1, args.seeds))))
+    print(f"profile {p}  ·  active judge v{av if av is not None else '-'}  ·  dataset '{ds}'")
+
+    if res["n"] == 0:
+        print("  no votes yet — say plays the analytic floor.")
+        return 0
+
+    auc = res["auc"]
+    verdict = "no signal" if auc != auc else ("strong" if auc >= 0.7 else "weak" if auc >= 0.55 else "near-chance")
+    print(f"  held-out AUC ({args.seeds}-seed mean): {auc:.4f}   (0.5 = no signal · {verdict})")
+    print(f"  votes: {res['n']}  (pos {res['n_pos']} / neg {res['n_neg']})")
+
+    by = res["by_case"]
+    if by and not args.quiet:
+        print("  coverage by case:")
+        for name, c in sorted(by.items(), key=lambda kv: -kv[1]):
+            print(f"    {name:<14} {c:>4}  {'#' * min(30, c // 8)}")
+        sparse = sorted(n for n, c in by.items() if c < 20)
+        if sparse:
+            print("  sparse (<20 votes):", ", ".join(sparse))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

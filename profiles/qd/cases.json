@@ -1,0 +1,12 @@
+{"name": "done", "type": "expression", "function": "complete", "base": "content"}
+{"name": "thinking", "type": "expression", "function": "working", "base": "curious"}
+{"name": "found", "type": "expression", "function": "discovery", "base": "recognition"}
+{"name": "error", "type": "expression", "function": "failure", "base": "worried"}
+{"name": "online", "type": "expression", "function": "ready", "base": "confident"}
+{"name": "question", "type": "expression", "function": "query", "base": "curious"}
+{"name": "chirp-greet", "type": "vocalization", "valence": 0.6, "arousal": 0.55, "tags": ["greet"]}
+{"name": "sigh", "type": "vocalization", "valence": -0.2, "arousal": -0.45, "tags": ["resigned"]}
+{"name": "laugh", "type": "vocalization", "valence": 0.8, "arousal": 0.6, "tags": ["delight"]}
+{"name": "gasp", "type": "vocalization", "valence": 0.1, "arousal": 0.8, "tags": ["surprise"]}
+{"name": "yes", "type": "vocalization", "valence": 0.0, "arousal": 0.2, "tags": ["ack"]}
+{"name": "no", "type": "vocalization", "valence": -0.4, "arousal": 0.2, "tags": ["deny"]}

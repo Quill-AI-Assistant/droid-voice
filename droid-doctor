@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""droid doctor — health-check every moving part (scriptable smoke test).
+
+    droid doctor [profile]      synth · generator · cases · dataset · judge · backend
+
+Exits non-zero if any check FAILs — wire it into CI or run it after a change."""
+import argparse
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="health-check the droid-voice stack")
+    ap.add_argument("profile", nargs="?", default="qd")
+    args = ap.parse_args()
+    p = args.profile
+
+    from dvoice import emotion as de    # noqa: E402
+    from dvoice import reward as R      # noqa: E402
+    from dvoice import versions         # noqa: E402
+    from dvoice import cases as C       # noqa: E402
+    from dvoice import store            # noqa: E402
+    from droid_synth import render_patch  # noqa: E402
+
+    fails = [0]
+
+    def check(name, fn):
+        try:
+            print(f"  [ok]   {name}: {fn()}")
+        except Exception as e:
+            fails[0] += 1
+            print(f"  [FAIL] {name}: {type(e).__name__}: {e}")
+
+    print(f"droid doctor · profile {p}")
+    check("synth render",
+          lambda: f"{len(render_patch(de.generate_arrangement(p, 0.4, 0.4, ''), 0.18))} samples")
+    check("generator: arrangement",
+          lambda: f"{len(de.generate_arrangement(p, 0.5, 0.5, '').get('notes', []))} notes")
+    check("generator: vocalization",
+          lambda: "ok" if de.generate_vocalization(p, 'yes', 0.0, 0.2).get('notes') else "EMPTY")
+    check("cases registry", lambda: f"{len(C.names(p))} cases")
+    check("dataset", lambda: f"{len(store.load(p))} rows (active '{store.active_dataset(p)}')")
+
+    def judge_check():
+        j = versions.load_active_judge(p)
+        if j is None:
+            return "no judge yet — say uses the analytic floor (ok)"
+        res = R.best_of_n(j, p, 0.5, 0.4, '', k=4, temperature=0.0)
+        return f"active v{versions.active_version(p)}; best_of_n ok (best_i={res['best_i']})"
+    check("judge / best_of_n", judge_check)
+    check("backend", lambda: R.backend())
+
+    print(f"\n{'ALL OK' if fails[0] == 0 else str(fails[0]) + ' CHECK(S) FAILED'}")
+    return 1 if fails[0] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

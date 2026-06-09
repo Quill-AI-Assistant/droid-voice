@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.tmp
+.pytest_cache/
+.venv/
+venv/
+
+# OS
+.DS_Store
+
+# Transient per-profile runtime artifacts. The shipped qd profile intentionally
+# keeps its case taxonomy (cases.json), cue WAVs, synthetic dataset + judge so the
+# demo is plug-and-play; only throwaway session state is ignored.
+profiles/*/.recent_plays.json
+profiles/*/gen/
+profiles/*/events/
+profiles/*/*.bak
+profiles/.trash/

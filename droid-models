@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""droid models — list / activate / roll back judge versions (scriptable).
+
+    droid models [profile]                list versions, active marked
+    droid models [profile] --activate N   make vN the active judge (say uses it)
+    droid models [profile] --rm N         soft-delete vN (-> judges/.trash/, reversible)
+
+The studio's `m` menu does the same interactively; this is the headless path."""
+import argparse
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from dvoice import versions           # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(description="list / activate / roll back judge versions")
+    ap.add_argument("profile", nargs="?", default="qd")
+    ap.add_argument("--activate", type=int, metavar="N", help="make version N active")
+    ap.add_argument("--rm", type=int, metavar="N", help="soft-delete version N")
+    args = ap.parse_args()
+    p = args.profile
+
+    if args.activate is not None:
+        try:
+            versions.set_active_version(p, args.activate)
+        except ValueError as e:
+            print(f"{p}: {e}", file=sys.stderr)
+            return 1
+        print(f"{p}: active judge -> v{args.activate}")
+        return 0
+
+    if args.rm is not None:
+        versions.delete_version(p, args.rm)
+        print(f"{p}: deleted v{args.rm} (moved to judges/.trash/; active -> v{versions.active_version(p)})")
+        return 0
+
+    idx = versions.list_versions(p)
+    active = versions.active_version(p)
+    if not idx:
+        print(f"{p}: no judge versions yet — train one with `droid train {p}`.")
+        return 0
+    print(f"{p}: {len(idx)} judge version(s)   (active = v{active})")
+    for e in idx:
+        mark = "*" if e["version"] == active else " "
+        print(f"  {mark} v{e['version']:<3} auc={e.get('auc')}  n={e.get('n_votes')}  "
+              f"dataset={e.get('dataset')}  gate={'ok' if e.get('gate') else 'FAIL'}  {e.get('ts') or ''}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

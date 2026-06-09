@@ -1,0 +1,17 @@
+{
+  "_comment": "Event vocabulary for the droid sound layer. Each event maps to a sound `slug` (the WAV filename, without extension, inside a profile dir) and a `category` (togglable in config.json). Add events here; drop a matching <slug>.wav into each profile. See README.md.",
+  "events": {
+    "session-start":     { "slug": "session-start",     "category": "session" },
+    "session-end":       { "slug": "session-end",       "category": "session" },
+    "subagent-spawn":    { "slug": "subagent-spawn",    "category": "session" },
+    "subagent-complete": { "slug": "subagent-complete", "category": "session" },
+    "memory-save":       { "slug": "memory-save",       "category": "session" },
+    "compact":           { "slug": "compact",           "category": "session" },
+    "error":             { "slug": "error",             "category": "session" },
+
+    "macropad-click":    { "slug": "click",             "category": "macropad" },
+    "macropad-on":       { "slug": "light-on",          "category": "macropad" },
+    "macropad-off":      { "slug": "light-off",         "category": "macropad" },
+    "macropad-error":    { "slug": "error",             "category": "macropad" }
+  }
+}

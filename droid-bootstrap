@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""droid bootstrap — synthetic CHARACTER votes for a profile no one ear-votes.
+
+    droid bootstrap <profile> [--per-case 24] [--train] [--sweep]
+
+The judge normally learns from by-ear y/n votes. To give a profile a working v0 judge
+WITHOUT ear votes, this writes a SYNTHETIC preference dataset grounded in the profile's
+DEFINED character (CHARACTER + GRAMMAR): among character-applied candidates it rewards
+the ones truest to that character (note budget near the grammar's syllable base, warble
+matching the character's, no spurious ring/grit, cutoff on-character) and rejects the rest.
+
+THIS IS A HEURISTIC, NOT A HUMAN EAR — a v0 so the profile has a working Best-of-N
+judge; refine later by ear (`droid collect <case> --profile <p>`). With --train it
+fits + gates (held-out AUC >= 0.55) + saves a judge version.
+"""
+import argparse
+import datetime
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from dvoice import cases as C        # noqa: E402
+from dvoice import emotion as de     # noqa: E402
+from dvoice import reward as R       # noqa: E402
+from dvoice import sessions          # noqa: E402
+from dvoice import store             # noqa: E402
+from dvoice import versions          # noqa: E402
+
+GATE_AUC, MIN_ROWS = 0.55, 30
+
+
+def _mean(xs):
+    xs = list(xs)
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def character_score(profile, patch):
+    """Higher = truer to the profile's DEFINED character (note budget, warble,
+    register), read from CHARACTER + GRAMMAR — no hardcoded per-voice ideal."""
+    notes = patch.get("notes", [])
+    n = len(notes)
+    fm = _mean(abs(x.get("fm_depth", 0.0)) for x in notes)
+    ring = _mean(x.get("ring_depth", 0.0) for x in notes)
+    grit = _mean(x.get("sh_rate", 0.0) for x in notes)
+    char = de.CHARACTER.get(profile, de.CHARACTER["qd"])
+    gram = de.GRAMMAR.get(profile, de.GRAMMAR["qd"])
+    lp = patch.get("lp_cutoff", char.get("lp", 2200.0))
+    note_ideal = gram.get("syl_base", 4)
+    warble_ideal = char.get("warble", 0.0)
+    s = 0.0
+    s -= abs(n - note_ideal) * 1.0                    # note budget on-character
+    s -= abs(fm - warble_ideal) * 0.15                # warble MATCHES the character
+    s -= ring * 0.4                                   # no spurious metallic ring (off-character)
+    s -= grit * 0.4                                   # no spurious sample-hold grit
+    s -= abs(lp - char.get("lp", 2200.0)) / 1500.0    # cutoff on-character
+    return s
+
+
+def main():
+    ap = argparse.ArgumentParser(description="synthetic character votes for a no-ear profile")
+    ap.add_argument("profile")
+    ap.add_argument("--per-case", type=int, default=24, help="candidates generated per case")
+    ap.add_argument("--train", action="store_true", help="fit + gate + save a judge after voting")
+    ap.add_argument("--sweep", action="store_true", help="hyperparameter sweep when training")
+    args = ap.parse_args()
+    prof = args.profile
+
+    names = C.names(prof)
+    if not names:
+        raise SystemExit(f"no cases for profile '{prof}'")
+
+    total = 0
+    for ci, cn in enumerate(names):
+        case = C.resolve(prof, cn)
+        if case is None:
+            continue
+        v, a = case["valence"], case["arousal"]
+        kind, name, tags = case.get("type"), case.get("name"), case.get("tags", ())
+        pool = R.diverse_candidates(prof, v, a, case.get("text", ""), k=args.per_case,
+                                    seed=ci, kind=kind, name=name, tags=tags)
+        scored = sorted(((character_score(prof, p), p) for p in pool),
+                        key=lambda t: t[0], reverse=True)
+        third = max(1, len(scored) // 3)
+        for _, p in scored[:third]:                          # truest-to-character -> good
+            sessions.log_vote(prof, case, p, "y", rnd=ci, session="bootstrap")
+            total += 1
+        for _, p in scored[-third:]:                         # busiest/dirtiest -> bad
+            sessions.log_vote(prof, case, p, "n", rnd=ci, session="bootstrap")
+            total += 1
+
+    print(f"bootstrap {prof}: wrote {total} synthetic CHARACTER votes across {len(names)} cases "
+          f"(HEURISTIC, not by-ear — refine with `droid collect <case> --profile {prof}`)")
+
+    if args.train:
+        res = R.sweep_fit(prof) if args.sweep else R.fit_and_eval(prof)
+        if res.get("judge") is None or res["n"] < MIN_ROWS:
+            print(f"  train skipped: need >= {MIN_ROWS} votes (have {res['n']})")
+            return 0
+        gate = res["auc"] >= GATE_AUC
+        if not gate:
+            print(f"  gate FAILED: held-out AUC {res['auc']:.3f} < {GATE_AUC} — not saved")
+            return 0
+        ver = versions.save_version(prof, res["judge"], auc=res["auc"], n_votes=res["n"],
+                                    dataset=store.active_dataset(prof), gate=gate,
+                                    ts=datetime.datetime.now().isoformat(timespec="seconds"))
+        print(f"  trained + saved judge v{ver}: held-out AUC {res['auc']:.4f} on {res['n']} votes (gate ok)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

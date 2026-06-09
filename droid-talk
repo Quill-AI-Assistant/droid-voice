@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""droid-talk — turn-based conversation with the droid voice (LLM-bridged).
+
+You talk; the droid replies, in character, turn by turn. A small LOCAL LLM (MLX,
+on-device, FREE — never a paid API) plays the droid: given the conversation so far it
+produces a short spoken reply + the emotion behind it. That reply feeds the
+droid voice (droid say), which renders + plays the droid sound — the analytic
+floor by default, or Best-of-N over the trained judge with --gp-voice. Context is kept
+across turns.
+
+The whole pipeline is VISIBLE per turn — the prompt sent, the raw LLM response,
+the sound-generation prompt, and the rendered sound's transcript — so you can see
+exactly how words become a droid utterance.
+
+    droid-talk                      interactive turn-based chat (you <-> droid)
+    droid-talk "we shipped it!"     single turn (the droid replies once)
+    droid-talk --show "..."         show the prompt + LLM response + mapping, don't play
+
+    --profile P    voice profile (default qd)
+    --model M      MLX chat model (default mlx-community/Qwen3.5-2B-4bit)
+    --url U        MLX OpenAI-compatible endpoint (default http://127.0.0.1:8080/v1)
+    --gp-voice     use the trained judge (Best-of-N) instead of the analytic floor
+    --no-play      render but stay silent
+    --quiet        hide the pipeline detail; show only the droid's reply
+
+Free + private by DEFAULT (local MLX). If the LLM is unreachable, a keyword
+heuristic gives the droid a canned reply so a turn never hard-fails.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import droid_emotion as de   # noqa: E402  (EMOTIONS = the authoritative v/a table)
+
+SAY = os.path.join(HERE, "droid-say")
+DEFAULT_URL = "http://127.0.0.1:8080/v1"
+DEFAULT_MODEL = "mlx-community/Qwen3.5-2B-4bit"   # fast (~1s/turn) local default; --url/--model for a bigger one
+MAX_HISTORY = 20             # trim the rolling dialogue so context stays bounded
+
+
+def _emotion_menu():
+    return ", ".join(f"{n}(v{v:+.1f},a{a:+.1f})" for n, (v, a) in sorted(de.EMOTIONS.items()))
+
+
+def _system_prompt():
+    return (
+        "You are an expressive sci-fi droid. Curiosity is your default, most stable state; "
+        "your cadence is deliberate; you are direct, resourceful, dry and mildly sarcastic but "
+        "hyper-competent. Every reply is VERY SHORT — 2 to 8 words, "
+        "a droid utterance, NEVER a sentence or paragraph. You are talking with a user, turn "
+        "by turn; stay in character and in context.\n"
+        f"Valid emotions (name, valence, arousal): {_emotion_menu()}.\n"
+        "Respond with ONLY compact JSON: {\"reply\": \"<your short spoken line, 2-8 words>\", "
+        "\"emotion\": \"<one valid emotion name matching your reply's feeling>\"}. End reply with "
+        "? for a question, ! for excitement. No prose, no markdown — JSON only."
+    )
+
+
+def converse(history, url, model, timeout=45):
+    """Send the running dialogue to the local LLM acting AS the droid. Returns
+    (mapping_or_None, raw_content) so the caller can SHOW the raw response."""
+    messages = [{"role": "system", "content": _system_prompt()}] + history
+    body = json.dumps({"model": model, "temperature": 0.5, "max_tokens": 80,
+                       "messages": messages}).encode()
+    req = urllib.request.Request(url.rstrip("/") + "/chat/completions", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read())
+    content = data["choices"][0]["message"]["content"]
+    return parse_mapping(content), content
+
+
+def parse_mapping(content):
+    """Extract the first {...} JSON from an LLM reply -> (emotion, reply_text), or None.
+    Accepts either a 'reply' or a 'text' key. Tolerant of stray prose around the JSON."""
+    m = re.search(r"\{.*\}", content or "", re.S)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+    except ValueError:
+        return None
+    emo = str(obj.get("emotion", "")).strip().lower()
+    text = str(obj.get("reply", obj.get("text", ""))).strip()
+    if emo not in de.EMOTIONS:
+        return None
+    return emo, (text or emo)
+
+
+# keyword -> (emotion, canned droid reply) fallback when the LLM is unreachable.
+_HEUR = [
+    (("thank", "cheers", "appreciate", "grateful"), ("happy", "anytime")),
+    (("oops", "my bad", "apolog", "sorry"), ("playful", "no harm done")),
+    (("error", "fail", "broke", "broken", "crash", "bug", "wrong"), ("worried", "that's not right")),
+    (("done", "fixed", "passed", "success", "shipped", "complete", "works"), ("happy", "nice, it works")),
+    (("wow", "amazing", "incredible", "finally", "awesome"), ("excited", "yes! finally")),
+    (("hello", "hi ", "hey", "greetings", "good morning"), ("curious", "oh, hello there")),
+    (("bye", "goodbye", "farewell", "good night", "goodnight"), ("wistful", "until next time")),
+    (("tired", "exhausted", "so slow", "drained"), ("tired", "mm, slow going")),
+    (("stuck", "ugh", "come on", "frustrat"), ("frustrated", "come on, work")),
+    (("wonder", "what if", "hmm", "interesting"), ("curious", "hm, interesting")),
+]
+
+
+def heuristic(message):
+    """No-LLM fallback: the droid's canned short reply + emotion from a keyword."""
+    m = (message or "").lower()
+    for keys, pair in _HEUR:
+        if any(k in m for k in keys):
+            return pair
+    if message.strip().endswith("?"):
+        return "curious", "hm, let me think"
+    return "neutral", "noted"
+
+
+def speak(profile, emotion, text, *, analytic, no_play):
+    """Render the droid's reply through the droid voice (droid-say). droid-say's stdout is
+    captured (not inherited) so droid-talk owns the display; returns (sound_prompt_str,
+    transcript, source). Analytic floor by default; analytic=False (--gp-voice) uses the judge."""
+    cmd = [SAY, emotion, "--profile", profile, "--text", text, "--transcript"]
+    if analytic:
+        cmd.append("--no-judge")
+    if no_play:
+        cmd.append("--no-play")
+    env = dict(os.environ)
+    env.setdefault("DROID_NO_EMBED", "1")        # prosody-only; skip the heavy Qwen embed load
+    cp = subprocess.run(cmd, cwd=HERE, env=env, capture_output=True, text=True)
+    transcript, source = "", ""
+    for line in cp.stdout.splitlines():
+        if "transcript:" in line:
+            transcript = line.split("transcript:", 1)[1].strip()
+        m = re.search(r"source=(\S+)", line)
+        if m:
+            source = m.group(1)
+    sound_prompt = f'say {emotion} --profile {profile} --text "{text}"{"" if analytic else ""}'
+    return sound_prompt, transcript, source
+
+
+def turn(user_msg, history, args):
+    """One conversational turn: append the user line, get the droid's reply, render it,
+    append the reply to history. Shows the full pipeline unless --quiet. Returns
+    (emotion, reply) for testability."""
+    user_msg = user_msg.strip()
+    if not user_msg:
+        return None
+    history.append({"role": "user", "content": user_msg})
+    raw, offline, mapped = None, "", None
+    try:
+        mapped, raw = converse(history, args.url, args.model)
+        if mapped is None:
+            offline = "bad-json"
+    except Exception as e:                        # transport down / timeout / HTTP error
+        offline = type(e).__name__
+    if mapped is None:
+        mapped = heuristic(user_msg)
+    emo, reply = mapped
+    history.append({"role": "assistant", "content": reply})
+    del history[:-MAX_HISTORY]                    # bound the rolling context
+
+    if not args.quiet:
+        print(f'  prompt → "{user_msg}"')
+        if raw is not None:
+            print(f"  llm    ← {raw.strip()}")
+        if offline:
+            print(f"  llm    ← [offline: {offline}] → keyword heuristic")
+    print(f'  droid ({emo}): "{reply}"')
+    if not args.show:
+        sound_prompt, transcript, source = speak(
+            args.profile, emo, reply, analytic=not args.gp_voice, no_play=args.no_play)
+        if not args.quiet:
+            print(f"  sound  → droid {sound_prompt}")
+            if transcript:
+                print(f"  ♪        {transcript}   (source={source})")
+    return emo, reply
+
+
+def _banner(args):
+    print("droid-talk — turn-based chat with the droid (blank line or Ctrl-D to quit).")
+    print(f"  voice={'model(experimental)' if args.gp_voice else 'analytic'}  llm={args.model} @ {args.url}")
+    if not args.quiet:
+        print("  ── system prompt (droid persona, sent every turn) ──")
+        for chunk in _system_prompt().split("\n"):
+            print(f"  | {chunk}")
+    print()
+
+
+def repl(args):
+    _banner(args)
+    history = []
+    while True:
+        try:
+            line = input("you> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not line.strip():
+            return 0
+        turn(line, history, args)
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(description="Turn-based conversation with the droid voice (LLM-bridged)")
+    ap.add_argument("message", nargs="*", help="a single turn; omit for an interactive chat")
+    ap.add_argument("--profile", default="qd", help="voice profile (default qd)")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="MLX chat model")
+    ap.add_argument("--url", default=DEFAULT_URL, help="MLX OpenAI-compatible endpoint")
+    ap.add_argument("--gp-voice", action="store_true", help="use the trained judge: Best-of-N over the analytic floor (by-ear quality still experimental)")
+    ap.add_argument("--no-play", action="store_true", help="render but do not play")
+    ap.add_argument("--show", action="store_true", help="show the prompt + LLM response + mapping; do not render")
+    ap.add_argument("--quiet", action="store_true", help="hide the pipeline detail; show only the droid's reply")
+    args = ap.parse_args(argv)
+
+    if args.message:
+        if not args.quiet:
+            print("  ── system prompt (droid persona) ──")
+            print(f"  | {_system_prompt()}")
+        turn(" ".join(args.message), [], args)
+        return 0
+    return repl(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]) or 0)

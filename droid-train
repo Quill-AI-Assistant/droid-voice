@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""droid-train — fit the JUDGE on the active dataset, gate, save a new MODEL VERSION.
+
+The studio's `t` does the same thing interactively. Saves profiles/<p>/judges/vN.npz
+(recorded with AUC / vote-count / dataset / date) and makes it the active version;
+`droid say` then uses it. Gated on held-out pairwise ranking accuracy.
+
+    ./droid-train qd                # fit + gate + save version
+    ./droid-train qd --dry-run      # fit + gate, do NOT save
+    ./droid-train qd --force        # save even if the gate fails
+"""
+import argparse
+import os
+import sys
+from datetime import datetime
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from dvoice import reward as R       # noqa: E402
+from dvoice import store             # noqa: E402
+from dvoice import versions          # noqa: E402
+
+# Gate is the leak-free WITHIN-CASE held-out AUC (reward.fit_and_eval); GATE_AUC and
+# MIN_ROWS are the single source of truth in reward.py, shared with the studio so they
+# can't disagree.
+GATE_AUC = R.GATE_AUC
+MIN_ROWS = R.MIN_ROWS
+
+
+def main():
+    ap = argparse.ArgumentParser(description="fit + gate + save a droid-voice model version")
+    ap.add_argument("profile", nargs="?", default="qd")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true", help="save even if the gate fails")
+    ap.add_argument("--sweep", action="store_true",
+                    help="grid-search (noise × length-scale) for the BEST model")
+    args = ap.parse_args()
+
+    ds = store.active_dataset(args.profile)
+    r = R.sweep_fit(args.profile) if args.sweep else R.fit_and_eval(args.profile)
+    if r["judge"] is None or r["n"] < MIN_ROWS:
+        raise SystemExit(f"only {r['n']} votes in dataset '{ds}' (need >= {MIN_ROWS}) — "
+                         f"collect more: droid collect <case>")
+    passed = r["auc"] >= GATE_AUC
+    top = ", ".join(f"{c}:{n}" for c, n in sorted(r["by_case"].items(), key=lambda x: -x[1])[:8])
+    print(f"dataset '{ds}': {r['n']} votes ({r['n_pos']}↑/{r['n_neg']}↓) over {len(r['by_case'])} cases")
+    print(f"  per-case: {top}")
+    if args.sweep:
+        print(f"  swept {len(r['grid'])} configs; best ls={r['ls']:.2f} noise={r['noise']:.2f}")
+    print(f"  held-out pairwise AUC: {r['auc']:.3f}  (gate >= {GATE_AUC})  ->  {'PASS' if passed else 'FAIL'}")
+
+    if args.dry_run:
+        print("  --dry-run: not saved.")
+        return 0
+    if not passed and not args.force:
+        raise SystemExit("  gate failed -> NOT saved (say keeps the analytic floor). --force to override.")
+    v = versions.save_version(args.profile, r["judge"], auc=r["auc"], n_votes=r["n"],
+                              dataset=ds, gate=passed, ts=datetime.now().isoformat(timespec="seconds"))
+    print(f"  saved model v{v} (now active).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

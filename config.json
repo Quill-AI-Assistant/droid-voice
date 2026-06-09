@@ -1,0 +1,14 @@
+{
+  "_comment": "Droid sound layer config. enabled = master on/off. categories = per-category toggle. qd is the only droid voice: profile.session 'auto' and profile.macropad both resolve to qd. volume 0..1 (afplay -v). fallback_profile is used when the active profile lacks a sound ('none' = silent).",
+  "enabled": true,
+  "categories": {
+    "session": false,
+    "macropad": true
+  },
+  "profile": {
+    "session": "auto",
+    "macropad": "qd"
+  },
+  "volume": 0.7,
+  "fallback_profile": "qd"
+}

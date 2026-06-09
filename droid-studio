@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""droid-studio — the interactive droid-voice CLI.
+
+ONE program. Launch it (bare `droid`) and everything is inside: a dashboard of every
+case by type with vote stats, the active model + its AUC, and the active dataset.
+From the menu you collect votes, train + save model versions, roll back models,
+create / switch datasets, and run the tools (eval quality, the blind A/B honesty
+test, a health check, bootstrap a v0). No subcommands to memorize.
+
+  [#] act on a case   t train+save   m models   d datasets   a add case   q quit
+"""
+import os
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from dvoice import cases as C        # noqa: E402
+from dvoice import colors            # noqa: E402
+from dvoice import emotion as de     # noqa: E402
+from dvoice import reward as R       # noqa: E402
+from dvoice import sessions          # noqa: E402
+from dvoice import store             # noqa: E402
+from dvoice import term              # noqa: E402
+from dvoice import synth             # noqa: E402
+from dvoice import versions          # noqa: E402
+
+GATE = R.GATE_AUC               # single source of truth (shared with droid-train)
+RULE = "─" * 64
+
+
+def _ask(prompt):
+    """input() that treats EOF / Ctrl-C as an empty answer (so menus never crash)."""
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
+
+def _now():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _read_key():
+    """Block for ONE key in cbreak (short-lived Console, so cooked input() still works
+    in the flows). Returns UP/DOWN/LEFT/RIGHT/ENTER or a single char."""
+    with term.Console() as c:
+        return c.getkey(None)
+
+
+def _pause():
+    print("  — press any key —", end="", flush=True)
+    _read_key()
+
+
+# ── dashboard (arrow-navigable) ───────────────────────────────────────────────
+def render_dashboard(profile, sel, numbuf=""):
+    """Clear + draw the dashboard with the sel-th case highlighted; return the
+    ordered [name] list. ↑/↓ move, type a number to jump, →/Enter open — see main()."""
+    ds = store.active_dataset(profile)
+    counts = store.counts(profile)
+    total = sum(c[0] for c in counts.values())
+    av = versions.active_version(profile)
+    meta = next((e for e in versions.list_versions(profile) if e["version"] == av), None)
+    judge = (colors.c(f"v{av} (AUC {meta['auc']:.2f})", "bgreen") if meta
+             else colors.c("none — analytic floor", "dim"))
+
+    print("\033[H\033[J", end="")                      # clear screen
+    print(colors.c("═" * 64, "cyan"))
+    print(" " + colors.c(f"DROID VOICE · {profile}", "bcyan", "bold")
+          + "        " + colors.c(f"backend: {R.backend()}", "dim"))
+    print(f" dataset: {colors.c(ds, 'byellow')} · {total} votes        model: {judge}")
+    print(colors.c(RULE, "cyan"))
+    order = []
+    for typ in C.TYPES:
+        names = C.names(profile, typ)
+        if not names:
+            continue
+        print(" " + colors.c(typ.upper(), "byellow", "bold"))
+        for name in names:
+            i = len(order)
+            order.append(name)
+            n_tot, n_keep, n_drop = counts.get(name, (0, 0, 0))
+            if i == sel:                               # highlight: inverse, no nested colour
+                star = "★" if n_keep else " "
+                bar = f"{n_keep}↑/{n_drop}↓" if n_tot else "—"
+                print(colors.c(f" ►{i + 1:>2} {star} {name:<16} {n_tot:>4} votes  {bar}", "inv", "bold"))
+            else:
+                star = colors.c("★", "byellow") if n_keep else " "
+                bar = (colors.c(f"{n_keep}↑", "green") + "/" + colors.c(f"{n_drop}↓", "red")
+                       if n_tot else colors.c("—", "dim"))
+                print(f"   {i + 1:>2} {star} {name:<16} {n_tot:>4} votes  {bar}")
+    print(colors.c(RULE, "cyan"))
+    hint = colors.c(f"        typing: {numbuf}_", "byellow") if numbuf else ""
+    print(colors.c(" ↑/↓ move · #+Enter pick · →/Enter open · t train · m models · "
+                   "d datasets · a add · x remove · q quit", "dim") + hint)
+    return order
+
+
+# ── case panel (single-key; arrows + letters) ─────────────────────────────────
+def case_panel(profile, name):
+    case = C.resolve(profile, name)
+    if case is None:
+        return
+    while True:
+        n_tot, n_keep, n_drop = store.counts(profile).get(name, (0, 0, 0))
+        print("\n  " + colors.c(f"── {name} [{case['type']}]", "bcyan", "bold")
+              + f"  v={case['valence']:+.2f} a={case['arousal']:+.2f}  ·  {n_tot} votes "
+              + f"({colors.c(str(n_keep) + '↑', 'green')}/{colors.c(str(n_drop) + '↓', 'red')})")
+        print(colors.c("     →/Enter/c collect · r review · s say (preview) · ←/b back", "dim"))
+        k = _read_key()
+        if k in ("b", "q", "LEFT"):
+            return
+        if k in ("c", "RIGHT", "ENTER"):
+            sessions.collect(profile, case)
+        elif k == "r":
+            sessions.review(profile, name)
+        elif k == "s":
+            say_preview(profile, case)
+
+
+def say_preview(profile, case):
+    judge = versions.load_active_judge(profile)
+    kind, name, tags = case.get("type"), case.get("name"), case.get("tags", ())
+    v, a, text = case["valence"], case["arousal"], case.get("text", "")
+    if judge is not None:
+        res = R.best_of_n(judge, profile, v, a, text, kind=kind, name=name, tags=tags)
+        patch, src = res["patch"], "best-of-N"
+    elif kind == "vocalization":
+        patch = de.generate_vocalization(profile, name, v, a, tags=tags)
+        src = "vocalization floor"
+    else:
+        patch = de.generate_arrangement(profile, v, a, text)
+        src = "analytic floor"
+    print(f"     ♪ {src}: {de.transcript(patch)}")
+    with tempfile.TemporaryDirectory() as td:
+        wav = os.path.join(td, "p.wav")
+        synth.write_wav(wav, synth.render_patch(patch, 0.18))
+        try:
+            subprocess.run(["afplay", wav], check=False)
+        except FileNotFoundError:
+            print("     (afplay not found)")
+
+
+# ── train + save version ──────────────────────────────────────────────────────
+def train_flow(profile):
+    ds = store.active_dataset(profile)
+    print(f"\n  training on dataset '{ds}' …")
+    r = R.fit_and_eval(profile)
+    if r["judge"] is None or r["n"] < 4:
+        print(f"  only {r['n']} votes — collect more before training.")
+        return
+    if r["n"] < R.MIN_ROWS:                              # same floor as droid-train
+        print(colors.c(f"  warning: only {r['n']} votes (< {R.MIN_ROWS}); the held-out AUC "
+                       f"is noisy below that and may not reflect real quality.", "yellow"))
+    passed = r["auc"] >= GATE
+    print(f"  {r['n']} votes ({r['n_pos']}↑/{r['n_neg']}↓) over {len(r['by_case'])} cases")
+    auc_str = colors.c(f"{r['auc']:.3f}", "bcyan")
+    verdict = (colors.c("PASS", "bgreen", "bold") if passed
+               else colors.c("FAIL (judge near chance)", "bred", "bold"))
+    print(f"  held-out WITHIN-CASE AUC: {auc_str}   gate >= {GATE}  ->  {verdict}")
+    if not passed:
+        if _ask("  gate failed. save anyway? [y/N] ").lower() != "y":
+            print("  not saved.")
+            return
+    elif _ask("  save as a new model version? [Y/n] ").lower() == "n":
+        print("  not saved.")
+        return
+    v = versions.save_version(profile, r["judge"], auc=r["auc"], n_votes=r["n"],
+                              dataset=ds, gate=passed, ts=_now())
+    print(f"  saved model v{v} (now active).")
+
+
+# ── model versions ──────────────────────────────────────────────────────────--
+def models_flow(profile):
+    while True:
+        vers = versions.list_versions(profile)
+        av = versions.active_version(profile)
+        print("\n  ── models")
+        if not vers:
+            print("     (none yet — train to create v1)")
+        for e in vers:
+            mark = " ←active" if e["version"] == av else ""
+            gate = "" if e.get("gate", True) else " [gate-fail]"
+            print(f"     v{e['version']:<3} AUC {e['auc']:.3f}  {e['n_votes']:>4} votes  "
+                  f"dataset={e.get('dataset','?')}  {e.get('ts','')}{gate}{mark}")
+        print("     [#] activate   [x #] delete   [b] back")
+        a = _ask("  models> ").lower().split()
+        if not a or a[0] in ("b", "q"):
+            return
+        try:
+            if a[0] == "x" and len(a) > 1:
+                versions.delete_version(profile, int(a[1]))
+                print(f"     deleted v{a[1]} (moved to judges/.trash).")
+            else:
+                versions.set_active_version(profile, int(a[0]))
+                print(f"     v{a[0]} is now active.")
+        except (ValueError, IndexError):
+            print("     ? a number, or 'x <n>'")
+
+
+# ── datasets ─────────────────────────────────────────────────────────────────-
+def datasets_flow(profile):
+    while True:
+        dss = store.list_datasets(profile)
+        active = store.active_dataset(profile)
+        print("\n  ── datasets")
+        for i, (name, n) in enumerate(dss, 1):
+            mark = " ←active" if name == active else ""
+            print(f"     {i:>2}  {name:<18} {n:>4} votes{mark}")
+        print("     [#] switch   [n] new   [b] back")
+        a = _ask("  datasets> ").lower().split()
+        if not a or a[0] in ("b", "q"):
+            return
+        if a[0] == "n":
+            name = _ask("     new dataset name: ").strip()
+            if not name or name == "main":
+                print("     need a non-'main' name.")
+                continue
+            cp = _ask(f"     copy current votes ('{active}') into it? [y/N] ").lower() == "y"
+            try:
+                store.create_dataset(profile, name, copy_from=active if cp else None)
+                print(f"     created '{name}' (now active).")
+            except ValueError as e:
+                print(f"     {e}")
+        else:
+            try:
+                name = dss[int(a[0]) - 1][0]
+                store.set_active_dataset(profile, name)
+                print(f"     active dataset: {name}")
+            except (ValueError, IndexError):
+                print("     ? a number, or 'n'")
+
+
+# ── add a case ────────────────────────────────────────────────────────────────
+def add_flow(profile):
+    name = _ask("\n  new case name: ").strip()
+    if not name:
+        return
+    t = _ask("  type — [e]motion / e[x]pression / [v]ocalization: ").lower()[:1]
+    typ = {"e": "emotion", "x": "expression", "v": "vocalization"}.get(t)
+    if typ is None:
+        print("  ? e/x/v")
+        return
+    case = {"name": name, "type": typ}
+    if typ == "expression":
+        base = _ask("  base emotion (e.g. content): ").strip()
+        if base:
+            case["base"] = base
+        fn = _ask("  function (optional, e.g. complete): ").strip()
+        if fn:
+            case["function"] = fn
+    if typ != "expression" or "base" not in case:
+        try:
+            case["valence"] = float(_ask("  valence -1..1: ") or "0")
+            case["arousal"] = float(_ask("  arousal -1..1: ") or "0")
+        except ValueError:
+            print("  ? valence/arousal must be numbers")
+            return
+    tags = _ask("  tags (comma-separated, optional): ").strip()
+    if tags:
+        case["tags"] = [x.strip() for x in tags.split(",") if x.strip()]
+    try:
+        C.add(profile, case)
+        print(f"  added {typ} '{name}'.")
+    except ValueError as e:
+        print(f"  {e}")
+
+
+# ── main loop (arrow-navigable) ───────────────────────────────────────────────
+def main(argv):
+    profile = argv[0] if argv else "qd"
+    if not sys.stdin.isatty():
+        raise SystemExit("droid studio needs a terminal (TTY).")
+    sel = 0
+    numbuf = ""
+    while True:
+        order = render_dashboard(profile, sel, numbuf)
+        if not order:
+            print(" no cases — press a to add one, q to quit.")
+        sel = max(0, min(sel, len(order) - 1)) if order else 0
+        key = _read_key()
+        # number entry: type 1-2 digits to jump the highlight; Enter then opens it
+        if key.isdigit() and order:
+            cand = numbuf + key
+            if not (1 <= int(cand) <= len(order)):          # overflow -> restart on this digit
+                cand = key if 1 <= int(key) <= len(order) else ""
+            numbuf = cand
+            if numbuf:
+                sel = int(numbuf) - 1
+            continue
+        numbuf = ""
+        if key in ("q", "quit"):
+            print("bye.")
+            return 0
+        if not order:
+            if key == "a":
+                add_flow(profile)
+                _pause()
+            continue
+        if key == "UP":
+            sel = (sel - 1) % len(order)
+        elif key == "DOWN":
+            sel = (sel + 1) % len(order)
+        elif key in ("RIGHT", "ENTER"):
+            case_panel(profile, order[sel])
+        elif key == "t":
+            train_flow(profile)
+            _pause()
+        elif key == "m":
+            models_flow(profile)
+        elif key == "d":
+            datasets_flow(profile)
+        elif key == "a":
+            add_flow(profile)
+            _pause()
+        elif key == "x":
+            name = order[sel]
+            n_tot = store.counts(profile).get(name, (0,))[0]
+            print(f"\n  remove '{name}' ({n_tot} votes)? [y/N] ", end="", flush=True)
+            if _read_key() == "y":
+                C.remove(profile, name)
+                print(colors.c(f"  removed '{name}' (votes kept in dataset; re-add to restore)", "yellow"))
+            else:
+                print("  kept.")
+            _pause()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]) or 0)

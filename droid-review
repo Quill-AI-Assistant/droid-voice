@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""droid-review — replay a case's votes; prune / re-label. Thin wrapper over
+dvoice.sessions.review (the same loop the studio uses).
+
+    x remove · f flip label · k promote-anchor · enter keep · r replay · q quit
+
+    ./droid-review proud
+    ./droid-review proud --auto xxf      # NON-INTERACTIVE: apply keys to first rows (test)
+"""
+import argparse
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from dvoice import emotion as de     # noqa: E402
+from dvoice import sessions          # noqa: E402
+from dvoice import store             # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(description="review / prune the vote dataset")
+    ap.add_argument("case")
+    ap.add_argument("--profile", default="qd")
+    ap.add_argument("--gain", type=float, default=0.18)
+    ap.add_argument("--no-play", action="store_true")
+    ap.add_argument("--auto", default=None, help="NON-INTERACTIVE keys applied to first rows (test)")
+    args = ap.parse_args()
+
+    if args.auto is not None:                                    # headless test path
+        rows = store.load(args.profile, case=args.case)
+        if not rows:
+            raise SystemExit(f"no votes for '{args.case}'.")
+        for row, key in zip(rows, args.auto.strip()):
+            st = sessions.apply_review_key(args.profile, row, key)
+            print(f"  {row['id']} [{row['label']}] {de.transcript(row['patch'])}  -> {st or 'kept'}")
+        return 0
+
+    if not sys.stdin.isatty():
+        raise SystemExit("not a TTY — run in a terminal, or use --auto for a headless test")
+    sessions.review(args.profile, args.case, gain=args.gain, no_play=args.no_play)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

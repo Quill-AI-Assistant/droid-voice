@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""droid profiles — every profile and its state (scriptable overview).
+
+    droid profiles      cases · votes · judge versions · active · cue WAVs, per profile
+
+qd is the one droid voice. This is the at-a-glance overview."""
+import argparse
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from dvoice import emotion as de       # noqa: E402
+from dvoice import cases as C          # noqa: E402
+from dvoice import store               # noqa: E402
+from dvoice import versions            # noqa: E402
+
+
+def main():
+    argparse.ArgumentParser(description="overview of all profiles").parse_args()
+    root = de.PROFILES
+    if not os.path.isdir(root):
+        print(f"no profiles dir at {root}")
+        return 1
+    profs = sorted(d for d in os.listdir(root)
+                   if os.path.isdir(os.path.join(root, d)) and not d.startswith("."))
+    print(f"profiles under {root}:")
+    print(f"  {'name':<12} {'cases':>5} {'votes':>6} {'judges':>6} {'active':>7} {'cue-wavs':>8}")
+    for p in profs:
+        try:
+            ncases = len(C.names(p))
+        except Exception:
+            ncases = 0
+        try:
+            nvotes = len(store.load(p))
+        except Exception:
+            nvotes = 0
+        try:
+            nver = len(versions.list_versions(p))
+            av = versions.active_version(p)
+        except Exception:
+            nver, av = 0, None
+        wavs = len([f for f in os.listdir(os.path.join(root, p)) if f.endswith(".wav")])
+        print(f"  {p:<12} {ncases:>5} {nvotes:>6} {nver:>6} {('v' + str(av)) if av is not None else '-':>7} {wavs:>8}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

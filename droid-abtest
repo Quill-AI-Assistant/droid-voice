@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""droid abtest — does the judge earn its keep? A blind A/B, by ear.
+
+    droid abtest <profile> [case] [--rounds 10] [--k 12]
+
+Each round plays TWO takes of a case, blind: one is the JUDGE's top pick, one a RANDOM
+candidate from the same diverse pool. You pick which sounds better; only then is the
+judge's slot revealed. Over the rounds it reports the judge's win-rate — >50% means the
+learned judge beats random-from-pool BY YOUR EAR (it earns its keep); ~50% means it's
+ceremony and the honest product is "nice procedural sounds". Needs a trained judge.
+"""
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import numpy as np                       # noqa: E402
+from dvoice import cases as C            # noqa: E402
+from dvoice import emotion as de         # noqa: E402
+from dvoice import reward as R           # noqa: E402
+from dvoice import versions              # noqa: E402
+from droid_synth import render_patch, write_wav   # noqa: E402
+
+
+def _play(wav):
+    try:
+        subprocess.run(["afplay", wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        pass
+
+
+def _render_tmp(patch, gain=0.18):
+    fd, p = tempfile.mkstemp(suffix=".wav", prefix="abtest_")
+    os.close(fd)
+    write_wav(p, render_patch(patch, gain))
+    return p
+
+
+def main():
+    ap = argparse.ArgumentParser(description="blind A/B: does the judge beat random, by ear?")
+    ap.add_argument("profile")
+    ap.add_argument("case", nargs="?", default=None, help="fix one case (default: random each round)")
+    ap.add_argument("--rounds", type=int, default=10)
+    ap.add_argument("--k", type=int, default=12, help="candidate pool size")
+    ap.add_argument("--no-play", action="store_true", help="don't play audio (CI/smoke)")
+    args = ap.parse_args()
+    play = (lambda w: None) if args.no_play else _play
+
+    judge = versions.load_active_judge(args.profile)
+    if judge is None:
+        raise SystemExit(f"no trained judge for '{args.profile}' — nothing to test "
+                         f"(train one: droid train {args.profile})")
+    names = C.names(args.profile)
+    if not names:
+        raise SystemExit(f"no cases for profile '{args.profile}'")
+
+    rng = np.random.default_rng()
+    print(f"♪ droid abtest · {args.profile} (judge v{versions.active_version(args.profile)})")
+    print("  blind A/B — judge's pick vs a random take from the same pool.")
+    print("  a/b = replay that take · 1 = A better · 2 = B better · s = skip · q = quit\n")
+
+    wins = trials = 0
+    for rnd in range(max(1, args.rounds)):
+        cn = args.case or str(rng.choice(names))
+        case = C.resolve(args.profile, cn)
+        if case is None:
+            continue
+        v, a = case["valence"], case["arousal"]
+        kind, name, tags = case.get("type"), case.get("name"), case.get("tags", ())
+        pool = R.diverse_candidates(args.profile, v, a, case.get("text", ""), k=args.k,
+                                    seed=int(rng.integers(1, 1_000_000)),
+                                    kind=kind, name=name, tags=tags)
+        phis = np.asarray([R.featurize(p, v, a) for p in pool])
+        scores = np.asarray(R.score(judge, phis), dtype=float)
+        ji = int(np.argmax(scores))                          # the judge's pick
+        others = [i for i in range(len(pool)) if i != ji]
+        ri = int(rng.choice(others)) if others else ji       # a random rival
+        judge_is_a = bool(rng.integers(0, 2))
+        pa, pb = (pool[ji], pool[ri]) if judge_is_a else (pool[ri], pool[ji])
+        wa, wb = _render_tmp(pa), _render_tmp(pb)
+
+        print(f"round {rnd + 1}/{args.rounds} — {cn}")
+        play(wa); print("  A played"); play(wb); print("  B played")
+        pick = None
+        while True:
+            try:
+                ans = input("  better? 1=A 2=B (a/b replay · s skip · q quit): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "q"
+            if ans == "1":
+                pick = "a"; break
+            if ans == "2":
+                pick = "b"; break
+            if ans == "a":
+                play(wa); continue                          # replay A
+            if ans == "b":
+                play(wb); continue                          # replay B
+            if ans == "r":
+                play(wa); play(wb); continue               # replay both
+            if ans == "s":
+                pick = None; break
+            if ans == "q":
+                pick = "q"; break
+            print("    1 (A) or 2 (B) — or a/b to replay, s skip, q quit")
+        for w in (wa, wb):
+            try:
+                os.unlink(w)
+            except OSError:
+                pass
+        if pick == "q":
+            break
+        if pick is None:
+            print()
+            continue
+        trials += 1
+        judge_slot = "a" if judge_is_a else "b"
+        won = pick == judge_slot
+        wins += int(won)
+        print(f"  → judge was {judge_slot.upper()} · you picked {pick.upper()} · "
+              f"{'JUDGE wins' if won else 'random wins'}  (running {wins}/{trials})\n")
+
+    if trials:
+        pct = 100.0 * wins / trials
+        verdict = ("earns its keep" if pct > 60 else
+                   "inconclusive — needs more rounds" if pct >= 40 else
+                   "NOT better than random (the judge is ceremony)")
+        print(f"\nRESULT: judge beat random {wins}/{trials} = {pct:.0f}%  →  {verdict}")
+        print("  (>50% over many rounds = the learned judge is real; ~50% = drop it.)")
+    else:
+        print("no judged rounds.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

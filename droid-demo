@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""droid demo — an INTERACTIVE playground for the droid voice.
+
+    droid demo                 interactive: type a case / "phrase [case]" / v,a → it reacts
+    droid demo --scene         play the scripted agent-session scene and exit
+    droid demo --tour          one render of every case and exit
+    droid demo --case proud    showcase a single case --n times and exit
+
+Interactive is the default. At the prompt:
+    proud                  vocalize the 'proud' emotion (a fresh take each time)
+    that failed [error]    show the words, vocalize [error] — the inline-tag vignette
+    0.5,0.3                an ad-hoc (valence,arousal) point
+    ?  scene  tour  temp <0..1>  profile <name>  q
+
+Every reaction is Best-of-N over the trained judge with novelty de-repetition.
+--no-play renders silently (for testing / piped input)."""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from dvoice import cases as C        # noqa: E402
+from dvoice import emotion as de     # noqa: E402
+from dvoice import reward as R       # noqa: E402
+from dvoice import versions          # noqa: E402
+from droid_synth import render_patch, write_wav   # noqa: E402  (FROZEN engine)
+
+# A scripted agent "session": (what the agent says/shows, the case it vocalizes).
+SCENE = [
+    ("…booting up",             "online"),
+    ("hey there",               "chirp-greet"),
+    ("let me look into that",   "thinking"),
+    ("wait — what's this?",     "question"),
+    ("found it",                "found"),
+    ("nailed it",               "proud"),
+    ("hah",                     "laugh"),
+    ("hm, that looks off",      "worried"),
+    ("that one failed",         "error"),
+    ("…damn",                   "sad"),
+    ("all done",                "done"),
+]
+
+# Keep functional/identity cues recognizable, let emotions roam.
+TYPE_TEMP = {"emotion": 0.8, "expression": 0.55, "vocalization": 0.45, "adhoc": 0.7}
+TAG_RE = re.compile(r"\[([^\]]+)\]")
+
+
+def _resolve(profile, token):
+    """A case name, or an ad-hoc 'v,a', or None."""
+    token = token.strip()
+    case = C.resolve(profile, token)
+    if case is not None:
+        return case
+    if "," in token:
+        try:
+            v, a = (float(x) for x in token.split(",", 1))
+            return {"name": token, "type": "adhoc", "valence": v, "arousal": a, "tags": (), "text": ""}
+        except ValueError:
+            return None
+    return None
+
+
+def _render(profile, judge, case, recent, temp_override):
+    v, a = case["valence"], case["arousal"]
+    kind, name, tags = case.get("type"), case.get("name"), case.get("tags", ())
+    text = case.get("text", "")
+    temp = temp_override if temp_override is not None else TYPE_TEMP.get(kind, 0.7)
+    if judge is not None:
+        res = R.best_of_n(judge, profile, v, a, text, k=12, seed=None, kind=kind, name=name,
+                          tags=tags, temperature=temp, top=6, novelty=0.6, recent=recent or None)
+        patch = res["patch"]
+        recent.append(R.featurize(patch, v, a).tolist())     # de-repetition across the session
+        return patch
+    if kind == "vocalization":
+        return de.generate_vocalization(profile, name, v, a, tags=tags)
+    return de.generate_arrangement(profile, v, a, text)
+
+
+def _play(wav):
+    try:
+        subprocess.run(["afplay", wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        pass
+
+
+def _emit(profile, judge, beats, recent, *, no_play=False, temp_override=None, out_dir=None, gain=0.18):
+    for i, (disp, token) in enumerate(beats):
+        case = _resolve(profile, token)
+        if case is None:
+            print(f"  (unknown '{token}' — type ? for cases)")
+            continue
+        patch = _render(profile, judge, case, recent, temp_override)
+        print(f"  {disp:<26}  ♪  [{case['name']}]")
+        audio = render_patch(patch, gain)
+        wav = None
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+            wav = os.path.join(out_dir, f"{i:02d}-{str(token).replace('/', '_')}.wav")
+            write_wav(wav, audio)
+        if not no_play:
+            tmp = wav
+            if tmp is None:
+                fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="droiddemo_")
+                os.close(fd)
+                write_wav(tmp, audio)
+            _play(tmp)
+
+
+def _parse_line(line):
+    """Split 'hi there [greeting]' -> ('hi there', ['greeting'])."""
+    tags = TAG_RE.findall(line)
+    spoken = TAG_RE.sub("", line).strip()
+    return spoken, tags
+
+
+def interactive(profile, judge, no_play=False, gain=0.18):
+    cases = C.names(profile)
+    av = versions.active_version(profile)
+    print(f"♪ droid demo · {profile} (judge v{av if av is not None else '-'}) — interactive")
+    print("  type a case, a \"phrase [case]\", or v,a · commands: ? scene tour temp <n> profile <p> q")
+    recent, temp = [], None
+    while True:
+        try:
+            line = input("droid> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line:
+            continue
+        low = line.lower()
+        if low in ("q", "quit", "exit"):
+            break
+        if low in ("?", "h", "help"):
+            print("  cases:", " ".join(cases))
+            print("  commands: scene · tour · temp <0..1> · profile <name> · q")
+            continue
+        if low == "scene":
+            _emit(profile, judge, SCENE, recent, no_play=no_play, temp_override=temp, gain=gain)
+            continue
+        if low == "tour":
+            _emit(profile, judge, [(n, n) for n in cases], recent, no_play=no_play, temp_override=temp, gain=gain)
+            continue
+        if low.startswith("temp"):
+            parts = line.split()
+            if len(parts) == 2:
+                try:
+                    temp = float(parts[1])
+                    print(f"  temperature = {temp:g}")
+                except ValueError:
+                    print("  usage: temp 0.7")
+            else:
+                temp = None
+                print("  temperature = per-case default")
+            continue
+        if low.startswith("profile"):
+            parts = line.split()
+            if len(parts) == 2:
+                profile, recent = parts[1], []
+                judge = versions.load_active_judge(profile)
+                cases = C.names(profile)
+                av = versions.active_version(profile)
+                print(f"  -> profile {profile} (judge v{av if av is not None else '-'})")
+            else:
+                print("  usage: profile qd")
+            continue
+        spoken, tags = _parse_line(line)
+        if tags:
+            if spoken:
+                print(f"  “{spoken}”")
+            beats = [(spoken or t, t) for t in tags]
+        else:
+            beats = [(line, line)]
+        _emit(profile, judge, beats, recent, no_play=no_play, temp_override=temp, gain=gain)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="interactive droid-voice demo")
+    ap.add_argument("--profile", default="qd")
+    ap.add_argument("--scene", action="store_true", help="play the scripted scene and exit")
+    ap.add_argument("--tour", action="store_true", help="render every case and exit")
+    ap.add_argument("--case", default=None, help="showcase a single case --n times and exit")
+    ap.add_argument("--n", type=int, default=5, help="repeats for --case")
+    ap.add_argument("--gain", type=float, default=0.18)
+    ap.add_argument("--no-play", action="store_true")
+    ap.add_argument("--out-dir", default=None, help="also write each wav here")
+    args = ap.parse_args()
+
+    judge = versions.load_active_judge(args.profile)
+    recent = []
+    if args.case:
+        beats = [(f"{args.case}  #{i + 1}", args.case) for i in range(max(1, args.n))]
+        _emit(args.profile, judge, beats, recent, no_play=args.no_play, out_dir=args.out_dir, gain=args.gain)
+    elif args.tour:
+        _emit(args.profile, judge, [(n, n) for n in C.names(args.profile)], recent,
+              no_play=args.no_play, out_dir=args.out_dir, gain=args.gain)
+    elif args.scene:
+        _emit(args.profile, judge, SCENE, recent, no_play=args.no_play, out_dir=args.out_dir, gain=args.gain)
+    else:
+        interactive(args.profile, judge, no_play=args.no_play, gain=args.gain)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

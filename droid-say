@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""droid-say — render + play a droid utterance via Best-of-N over the judge.
+
+Generates structurally-diverse candidates from the FROZEN synth, scores them with
+the trained judge (profiles/<p>/judge.npz), and plays the best. If there is no judge
+(or --no-judge), it plays the plain analytic phrase — the always-on floor. Never
+fails a caller (like the old droid-speak / droid-play).
+
+    droid say proud                  # Best-of-N if a judge exists, else analytic
+    droid say chirp-greet --k 16     # a vocalization
+    droid say done --no-judge        # force the analytic floor
+    droid say proud --transcript --no-play --out /tmp/p.wav
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from dvoice import cases as C        # noqa: E402
+from dvoice import emotion as de     # noqa: E402
+from dvoice import reward as R       # noqa: E402
+from dvoice import versions          # noqa: E402
+from droid_synth import render_patch, write_wav   # noqa: E402  (FROZEN engine)
+
+# Recent-plays ring (per profile) → novelty penalty so a session never repeats itself.
+# A small JSON file, NOT a daemon: each `droid say` loads it, steers away from these
+# feature vectors, then appends the one it chose. Reset by deleting the file.
+RECENT_MAX = 16
+
+
+def _recent_path(profile):
+    return os.path.join(HERE, "profiles", profile, ".recent_plays.json")
+
+
+def _load_recent(profile):
+    try:
+        with open(_recent_path(profile)) as f:
+            return list(json.load(f))
+    except Exception:
+        return []
+
+
+def _save_recent(profile, vecs):
+    try:
+        p = _recent_path(profile)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            json.dump(vecs[-RECENT_MAX:], f)
+    except Exception:
+        pass
+
+
+def _play(wav, block=False):
+    try:
+        run = subprocess.run if block else subprocess.Popen
+        run(["afplay", wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        pass
+
+
+def main():
+    ap = argparse.ArgumentParser(description="render a droid utterance (Best-of-N)")
+    ap.add_argument("case", help="case name (emotion/expression/vocalization) or 'v,a'")
+    ap.add_argument("--profile", default="qd")
+    ap.add_argument("--text", default=None)
+    ap.add_argument("--k", type=int, default=12, help="Best-of-N candidate count")
+    ap.add_argument("--sigma", type=float, default=0.18)
+    ap.add_argument("--gain", type=float, default=0.18)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="fix the RNG (default: random each call → a fresh take each time)")
+    ap.add_argument("--temp", type=float, default=None,
+                    help="sampling temperature (default: per-case-type; 0 = greedy/old argmax)")
+    ap.add_argument("--top", type=int, default=6,
+                    help="sample among the top-N candidates only (quality floor)")
+    ap.add_argument("--novelty", type=float, default=0.5,
+                    help="penalize candidates similar to recent plays (0 = off)")
+    ap.add_argument("--n", type=int, default=1,
+                    help="render/play N variants in a row (variety demo)")
+    ap.add_argument("--sweep", action="store_true",
+                    help="render a temperature ladder (0→0.9) for A/B — pick T by ear")
+    ap.add_argument("--no-judge", action="store_true", help="force the analytic floor")
+    ap.add_argument("--no-play", action="store_true")
+    ap.add_argument("--transcript", action="store_true")
+    ap.add_argument("--out", default=None, help="also write the wav here")
+    args = ap.parse_args()
+
+    case = C.resolve(args.profile, args.case)
+    if case is None and "," in args.case:                    # ad-hoc 'v,a'
+        v, a = (float(x) for x in args.case.split(",", 1))
+        case = {"name": args.case, "type": "adhoc", "valence": v, "arousal": a, "text": ""}
+    if case is None:
+        raise SystemExit(f"unknown case '{args.case}'. try: droid cases list")
+    v, a = case["valence"], case["arousal"]
+    text = args.text if args.text is not None else case.get("text", "")
+
+    judge = None if args.no_judge else versions.load_active_judge(args.profile)
+    kind, name, tags = case.get("type"), case.get("name"), case.get("tags", ())
+
+    # Per-case-type temperature: keep functional/identity cues (beeps, status acts)
+    # recognizable, let emotions roam. The novelty ring still prevents exact repeats
+    # at any temperature. Override with --temp.
+    TYPE_TEMP = {"emotion": 0.8, "expression": 0.55, "vocalization": 0.45, "adhoc": 0.7}
+    temp = args.temp if args.temp is not None else TYPE_TEMP.get(kind, 0.7)
+
+    use_novelty = judge is not None and args.novelty > 0
+    recent = _load_recent(args.profile) if use_novelty else []
+
+    def render(temperature):
+        if judge is not None:
+            res = R.best_of_n(judge, args.profile, v, a, text, k=args.k, sigma=args.sigma,
+                              seed=args.seed, kind=kind, name=name, tags=tags,
+                              temperature=temperature, top=args.top,
+                              novelty=args.novelty, recent=recent or None)
+            return res["patch"], f"best-of-{args.k} (judge, T={temperature:g})"
+        if kind == "vocalization":
+            return de.generate_vocalization(args.profile, name, v, a, tags=tags), "vocalization (floor)"
+        return de.generate_arrangement(args.profile, v, a, text), "analytic (floor)"
+
+    def emit(patch, source, disp="", suffix="", block=False):
+        print(f"{args.profile} {case['name']} (v={v:+.2f} a={a:+.2f})  source={source}{disp}")
+        if args.transcript:
+            print(f"  transcript: {de.transcript(patch)}")
+        audio = render_patch(patch, args.gain)
+        out = args.out
+        if out and suffix:                                   # spread → <name>-<suffix>.wav
+            base, ext = os.path.splitext(out)
+            out = f"{base}-{suffix}{ext or '.wav'}"
+        if out:
+            os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+            write_wav(out, audio)
+            print(f"  wrote {out}")
+        if not args.no_play:
+            tmp = out
+            if tmp is None:
+                fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="droidsay_")
+                os.close(fd)
+                write_wav(tmp, audio)
+            print("  ♪ playing")
+            _play(tmp, block=block)
+
+    if args.sweep:                                           # listening gate: one render per T
+        for t in (0.0, 0.3, 0.5, 0.7, 0.9):
+            patch, source = render(t)
+            emit(patch, source, disp=f"  T={t:g}", suffix=f"T{t:g}", block=True)
+        return 0
+
+    n = max(1, args.n)
+    if n > 1 and judge is not None:                          # a "play N" set: spread, not N near-clones
+        patches = R.diverse_set(judge, args.profile, v, a, text, n=n, seed=args.seed,
+                                kind=kind, name=name, tags=tags)
+        src = f"diverse-set/{n} (judge, farthest-point)"
+        for i, p in enumerate(patches):
+            emit(p, src, disp=f" [{i + 1}/{n}]", suffix=str(i + 1), block=True)
+        return 0
+    for i in range(n):
+        patch, source = render(temp)
+        if use_novelty:
+            recent.append(R.featurize(patch, v, a).tolist())     # steer the next render away
+        emit(patch, source, disp=(f" [{i + 1}/{n}]" if n > 1 else ""),
+             suffix=(str(i + 1) if n > 1 else ""), block=(n > 1))
+    if use_novelty:
+        _save_recent(args.profile, recent)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

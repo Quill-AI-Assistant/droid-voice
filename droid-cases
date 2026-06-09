@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""droid-cases — the TAXONOMY: list cases or add a new one (incl. vocalizations).
+
+A case is anything you can collect/render: an emotion (valence/arousal point), an
+expression (communicative status over a base emotion), or a vocalization (a
+non-verbal affect burst). Adding one is a single cases.json row — no code change.
+
+    droid cases                       # list all cases by type, with vote counts
+    droid cases list
+    droid cases add chuckle vocalization --valence 0.7 --arousal 0.4 --tags amused
+    droid cases add greeting expression --base content --function hello
+    droid cases add smug emotion --valence 0.5 --arousal 0.1
+"""
+import argparse
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from dvoice import cases as C        # noqa: E402
+from dvoice import store             # noqa: E402
+
+
+def cmd_list(profile):
+    counts = store.counts(profile)
+    for typ in C.TYPES:
+        members = C.names(profile, typ)        # excludes removed cases
+        if not members:
+            continue
+        print(f"\n{typ}  ({len(members)})")
+        for n in members:
+            r = C.resolve(profile, n) or {}
+            nv = counts.get(n, (0,))[0]
+            extra = ""
+            if r.get("base"):
+                extra += f" base={r['base']}"
+            if r.get("function"):
+                extra += f" fn={r['function']}"
+            if r.get("tags"):
+                extra += f" tags={','.join(r['tags'])}"
+            print(f"  {n:<16} v={r.get('valence', 0):+.2f} a={r.get('arousal', 0):+.2f}  "
+                  f"votes={nv}{extra}")
+    print()
+
+
+def cmd_add(profile, args):
+    case = {"name": args.name, "type": args.type}
+    if args.valence is not None:
+        case["valence"] = args.valence
+    if args.arousal is not None:
+        case["arousal"] = args.arousal
+    if args.base:
+        case["base"] = args.base
+    if args.function:
+        case["function"] = args.function
+    if args.tags:
+        case["tags"] = [t.strip() for t in args.tags.split(",") if t.strip()]
+    # a vocalization/emotion needs coords (directly or via base); validate minimally
+    if args.type in ("emotion", "vocalization") and "valence" not in case and "base" not in case:
+        raise SystemExit(f"{args.type} '{args.name}' needs --valence/--arousal (or --base)")
+    if args.type == "expression" and "base" not in case and "valence" not in case:
+        raise SystemExit(f"expression '{args.name}' needs --base <emotion> (or --valence/--arousal)")
+    C.add(profile, case)
+    v, a = C.va(case, C.load(profile))
+    print(f"added {args.type} '{args.name}'  v={v:+.2f} a={a:+.2f}  -> collect: droid collect {args.name}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="droid-voice taxonomy")
+    ap.add_argument("--profile", default="qd")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("list")
+    pa = sub.add_parser("add")
+    pa.add_argument("name")
+    pa.add_argument("type", choices=C.TYPES)
+    pa.add_argument("--valence", type=float, default=None)
+    pa.add_argument("--arousal", type=float, default=None)
+    pa.add_argument("--base", default=None, help="base emotion (for expressions)")
+    pa.add_argument("--function", default=None, help="communicative function (for expressions)")
+    pa.add_argument("--tags", default=None, help="comma-separated tags")
+    pr = sub.add_parser("remove")
+    pr.add_argument("name")
+    pn = sub.add_parser("rename")
+    pn.add_argument("old")
+    pn.add_argument("new")
+    args = ap.parse_args()
+
+    if args.cmd == "add":
+        cmd_add(args.profile, args)
+    elif args.cmd == "remove":
+        C.remove(args.profile, args.name)
+        print(f"removed '{args.name}' (soft — re-add to restore)")
+    elif args.cmd == "rename":
+        n = C.rename(args.profile, args.old, args.new)
+        print(f"renamed '{args.old}' -> '{args.new}' ({n} votes migrated)")
+    else:
+        cmd_list(args.profile)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

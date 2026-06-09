@@ -1,0 +1,11 @@
+# qd droid cues — gain=0.18, homogenous DSP family
+click.wav	0.085s	gain=0.18
+light-on.wav	0.272s	gain=0.18
+light-off.wav	0.292s	gain=0.18
+error.wav	0.420s	gain=0.18
+session-start.wav	0.364s	gain=0.18
+session-end.wav	0.384s	gain=0.18
+subagent-spawn.wav	0.110s	gain=0.18
+subagent-complete.wav	0.232s	gain=0.18
+memory-save.wav	0.150s	gain=0.18
+compact.wav	0.340s	gain=0.18

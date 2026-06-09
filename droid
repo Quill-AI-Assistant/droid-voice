@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""droid — one CLI for the synthesized droid voice.
+
+    droid                          launch the INTERACTIVE STUDIO (dashboard + menus)
+
+The studio is the main way in: a dashboard of every case by type with vote stats, the
+active model + AUC, and the active dataset — collect, train+save versions, roll back
+models, and manage datasets all from inside. The verbs below are scriptable shortcuts.
+
+    droid cases   [list|add ...]   the taxonomy: emotion / expression / vocalization
+    droid collect <case>           vote y/n/k/s on diverse candidates -> dataset.jsonl
+    droid review  <case>           replay + prune / re-label the dataset (soft-delete)
+    droid train   [profile]        fit the JUDGE on the votes, held-out gate, save judge.npz
+    droid say     <case>           Best-of-N: generate -> judge-rank -> sample (varied)
+    droid demo                     INTERACTIVE playground — type a case/"phrase [tag]"/v,a
+                                   (or --scene / --tour / --case to run-and-exit)
+
+    droid eval    [profile]        judge AUC + per-case coverage (scriptable stats)
+    droid models  [profile]        list / --activate N / --rm N judge versions
+    droid profiles                 every profile and its state (qd; untrained-johndoe)
+    droid doctor  [profile]        health-check synth / generator / judge / dataset
+    droid bootstrap <profile>      synthetic character votes (no ear) -> train a v0 judge
+    droid abtest  <profile> [case] blind A/B by ear: does the judge beat random?
+    droid judge   <profile> [case] alias for abtest — judge vs random, picked BY EAR
+    droid calibrate <profile> [case] alias for abtest — re-confirm the judge by ear
+    droid web     [--port N]       launch the browser DEMO vignette (demo-only)
+
+    droid cue     <event>          play a session / macropad cue (the beep layer)
+    droid seed    <profile>        (re)seed the reproducible emotion anchor set
+    droid talk    [message]        legacy turn-based chat -> droid voice
+
+The voice is GENERATE then JUDGE: the FROZEN synth proposes structurally-varied
+candidates; the judge (learned from your votes) ranks them; Best-of-N plays the best.
+With no judge yet, `say` plays the rich analytic phrase (the always-on floor).
+
+Thin dispatcher: each verb runs its implementation in-process. `droid` -> this help."""
+import os
+import runpy
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+VERBS = {
+    "studio":  ("droid-studio", []),
+    "cases":   ("droid-cases", []),
+    "collect": ("droid-collect", []),
+    "review":  ("droid-review", []),
+    "train":   ("droid-train", []),
+    "say":     ("droid-say", []),
+    "demo":    ("droid-demo", []),
+    "eval":    ("droid-eval", []),
+    "models":  ("droid-models", []),
+    "profiles": ("droid-profiles", []),
+    "doctor":  ("droid-doctor", []),
+    "bootstrap": ("droid-bootstrap", []),
+    "abtest":  ("droid-abtest", []),
+    "judge":   ("droid-abtest", []),       # by-ear judge vs random (alias for abtest)
+    "calibrate": ("droid-abtest", []),     # re-confirm the judge by ear (alias for abtest)
+    "web":     ("web/server.py", []),
+    "cue":     ("droid-play", []),
+    "seed":    ("seed-v0.py", []),
+    "talk":    ("droid-talk", []),
+    "list":    ("droid-cases", ["list"]),
+}
+
+
+def main(argv):
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if not argv:
+        argv = ["studio"]                       # bare `droid` -> the interactive studio
+    verb, rest = argv[0], argv[1:]
+    if verb not in VERBS:
+        print(f"droid: unknown verb '{verb}'. verbs: {', '.join(VERBS)}", file=sys.stderr)
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    script, prefix = VERBS[verb]
+    target = os.path.join(HERE, script)
+    if not os.path.exists(target):
+        print(f"droid: missing implementation {target}", file=sys.stderr)
+        return 1
+    sys.argv = [f"droid {verb}"] + prefix + rest
+    runpy.run_path(target, run_name="__main__")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]) or 0)

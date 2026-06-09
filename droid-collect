@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""droid-collect — gather preference votes on STRUCTURALLY DIVERSE candidates.
+
+Thin wrapper over dvoice.sessions.collect (the same loop the studio uses).
+
+    y good · n bad · k keep(anchor) · s skip · r replay · . next batch · q quit
+
+    ./droid-collect proud                 # vote on the 'proud' emotion
+    ./droid-collect chirp-greet --k 16     # a vocalization, 16 per batch
+    ./droid-collect proud --auto ynks      # NON-INTERACTIVE: apply keys to first cands (test)
+"""
+import argparse
+import os
+import sys
+import uuid
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from dvoice import cases as C        # noqa: E402
+from dvoice import reward as R       # noqa: E402
+from dvoice import sessions          # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(description="collect droid-voice preference votes")
+    ap.add_argument("case")
+    ap.add_argument("--profile", default="qd")
+    ap.add_argument("--k", type=int, default=12)
+    ap.add_argument("--sigma", type=float, default=0.18)
+    ap.add_argument("--gain", type=float, default=0.18)
+    ap.add_argument("--no-play", action="store_true")
+    ap.add_argument("--auto", default=None,
+                    help="NON-INTERACTIVE: key string (e.g. 'ynks') applied to the first candidates, then exit")
+    args = ap.parse_args()
+
+    case = C.resolve(args.profile, args.case)
+    if case is None:
+        raise SystemExit(f"unknown case '{args.case}'. try: droid cases list")
+
+    if args.auto is not None:                                    # headless test path
+        session = uuid.uuid4().hex
+        cands = R.diverse_candidates(args.profile, case["valence"], case["arousal"],
+                                     case.get("text", ""), k=args.k, sigma=args.sigma, seed=0)
+        tally = {"y": 0, "n": 0, "s": 0}
+        for i, key in enumerate(args.auto.strip()):
+            if i >= len(cands):
+                break
+            if key in ("y", "n"):
+                sessions.log_vote(args.profile, case, cands[i], key, rnd=0, session=session, gen="auto")
+            tally[key] = tally.get(key, 0) + 1
+        print(f"logged: { {k: tally[k] for k in ('y', 'n')} }  skipped: {tally.get('s', 0)}")
+        return 0
+
+    if not sys.stdin.isatty():
+        raise SystemExit("not a TTY — run in a terminal, or use --auto for a headless test")
+    sessions.collect(args.profile, case, k=args.k, sigma=args.sigma,
+                     gain=args.gain, no_play=args.no_play)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
